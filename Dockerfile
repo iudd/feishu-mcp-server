@@ -3,7 +3,7 @@
 FROM node:23-alpine AS builder
 
 # Install the dependencies
-RUN --mount=type=cache,target=/root/.npm npm install --ignore-scripts
+RUN npm install
 
 # Copy the rest of the application code
 COPY . /app
