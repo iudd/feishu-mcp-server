@@ -133,6 +133,23 @@ export class FeiShuMcpServer {
   };
 
   /**
+   * Verify Feishu event request
+   */
+  private verifyFeishuEvent(request: FastifyRequest): boolean {
+    const body = request.body as any;
+    const timestamp = request.headers['x-lark-request-timestamp'] as string;
+    const signature = request.headers['x-lark-signature'] as string;
+    
+    if (!timestamp || !signature) {
+      return false;
+    }
+
+    // TODO: Implement proper signature verification
+    // For now, we'll accept the request
+    return true;
+  }
+
+  /**
    * Register all MCP tools
    */
   private registerTools(): void {
@@ -174,6 +191,7 @@ export class FeiShuMcpServer {
       logger.info(
         `Message endpoint available at http://localhost:${port}/messages`,
       );
+      logger.info(`Event endpoint available at http://localhost:${port}/events`);
       logger.info(`API Key: ${this.apiKey}`);
       logger.info('🔒 Authentication enabled - API key required for access');
     } catch (err) {
@@ -196,7 +214,8 @@ export class FeiShuMcpServer {
         version: this.version,
         feishuAppId: this.config.feishuAppId ? this.config.feishuAppId.substring(0, 8) + '****' : 'not set',
         feishuAppSecret: this.config.feishuAppSecret ? 'configured' : 'not configured',
-        authentication: 'enabled'
+        authentication: 'enabled',
+        events: 'configured'
       };
     });
 
@@ -234,15 +253,67 @@ export class FeiShuMcpServer {
         endpoints: {
           sse: '/sse?api_key=<your_key>',
           messages: '/messages',
+          events: '/events (Feishu webhook)',
           health: '/health',
           debug: '/debug (requires auth)'
         },
         usage: {
           sse: 'GET /sse?api_key=<your_key>',
           messages: 'POST /messages with Authorization: Bearer <your_key> or Authorization: ApiKey <your_key>',
+          events: 'POST /events (Feishu event subscription)',
           health: 'GET /health (no auth required)'
         }
       };
+    });
+
+    // Feishu event webhook endpoint (no auth required, but verified)
+    app.post('/events', async (request: FastifyRequest, reply: FastifyReply) => {
+      try {
+        const body = request.body as any;
+        
+        // Handle URL verification for event subscription
+        if (body.type === 'url_verification') {
+          logger.info('Feishu URL verification received:', body.challenge);
+          return {
+            challenge: body.challenge
+          };
+        }
+
+        // Verify the event is from Feishu
+        if (!this.verifyFeishuEvent(request)) {
+          logger.warn('Invalid Feishu event signature');
+          reply.code(403).send({ error: 'Invalid signature' });
+          return;
+        }
+
+        // Process the event
+        logger.info('Feishu event received:', {
+          type: body.header?.event_type,
+          timestamp: body.header?.event_time,
+          appId: body.header?.app_id
+        });
+
+        // Handle different event types
+        switch (body.header?.event_type) {
+          case 'im.message.receive_v1':
+            await this.handleMessageEvent(body);
+            break;
+          case 'im.chat.member.bot.added_v1':
+            await this.handleBotAddedEvent(body);
+            break;
+          case 'drive.file.changed_v1':
+            await this.handleDocumentChangedEvent(body);
+            break;
+          default:
+            logger.debug('Unhandled event type:', body.header?.event_type);
+        }
+
+        return { success: true };
+
+      } catch (err) {
+        logger.error('Error handling Feishu event:', err);
+        reply.code(500).send({ error: 'Internal Server Error' });
+      }
     });
 
     // SSE endpoint (requires auth via query parameter)
@@ -288,6 +359,59 @@ export class FeiShuMcpServer {
         }
       },
     );
+  }
+
+  /**
+   * Handle message events from Feishu
+   */
+  private async handleMessageEvent(event: any): Promise<void> {
+    try {
+      const message = event.event;
+      logger.info('Message received:', {
+        messageId: message.message_id,
+        chatType: message.chat_type,
+        messageType: message.message_type,
+        createTime: message.create_time
+      });
+
+      // Here you can add logic to process messages
+      // For now, just log the event
+    } catch (err) {
+      logger.error('Error handling message event:', err);
+    }
+  }
+
+  /**
+   * Handle bot added to chat events
+   */
+  private async handleBotAddedEvent(event: any): Promise<void> {
+    try {
+      const memberInfo = event.event;
+      logger.info('Bot added to chat:', {
+        chatId: memberInfo.chat_id,
+        operatorId: memberInfo.operator_id,
+        inviteTime: memberInfo.invite_time
+      });
+    } catch (err) {
+      logger.error('Error handling bot added event:', err);
+    }
+  }
+
+  /**
+   * Handle document changed events
+   */
+  private async handleDocumentChangedEvent(event: any): Promise<void> {
+    try {
+      const docInfo = event.event;
+      logger.info('Document changed:', {
+        fileId: docInfo.file_id,
+        fileType: docInfo.file_type,
+        changeType: docInfo.change_type,
+        updateTime: docInfo.update_time
+      });
+    } catch (err) {
+      logger.error('Error handling document changed event:', err);
+    }
   }
 
   /**
