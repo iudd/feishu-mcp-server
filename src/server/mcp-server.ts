@@ -9,6 +9,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import fastify from 'fastify';
 import { FastifySSETransport } from './adapters/fastify-sse.js';
 import { registerAllTools } from './tools/index.js';
+
 /**
  * MCP Server Implementation
  *
@@ -31,6 +32,8 @@ export class FeiShuMcpServer {
   private readonly version = '0.0.1';
   /** Server configuration */
   private config: ServerConfig;
+  /** API Key for authentication */
+  private readonly apiKey: string;
 
   /**
    * Create a new FeiShu MCP server
@@ -39,6 +42,14 @@ export class FeiShuMcpServer {
    */
   constructor(config: ServerConfig) {
     this.config = config;
+    
+    // Get API key from environment or generate one
+    this.apiKey = process.env.MCP_API_KEY || this.generateApiKey();
+    
+    if (!process.env.MCP_API_KEY) {
+      logger.warn('No MCP_API_KEY environment variable set. Using generated key:', this.apiKey);
+      logger.warn('Please set MCP_API_KEY environment variable for security.');
+    }
     
     // Initialize FeiShu services
     const apiConfig: ApiClientConfig = {
@@ -67,6 +78,59 @@ export class FeiShuMcpServer {
     // Register all tools
     this.registerTools();
   }
+
+  /**
+   * Generate a random API key
+   */
+  private generateApiKey(): string {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    let result = '';
+    for (let i = 0; i < 32; i++) {
+      result += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return result;
+  }
+
+  /**
+   * Authenticate request
+   */
+  private authenticate(request: FastifyRequest): boolean {
+    const authHeader = request.headers.authorization;
+    if (!authHeader) {
+      return false;
+    }
+
+    // Support both Bearer token and API key in header
+    if (authHeader.startsWith('Bearer ')) {
+      return authHeader.substring(7) === this.apiKey;
+    }
+    
+    if (authHeader.startsWith('ApiKey ')) {
+      return authHeader.substring(7) === this.apiKey;
+    }
+
+    // Check for API key in query parameters (for SSE connections)
+    const queryKey = (request.query as any)?.api_key;
+    if (queryKey) {
+      return queryKey === this.apiKey;
+    }
+
+    return false;
+  }
+
+  /**
+   * Middleware to check authentication
+   */
+  private requireAuth = async (request: FastifyRequest, reply: FastifyReply) => {
+    if (!this.authenticate(request)) {
+      reply.code(401).send({ 
+        error: 'Unauthorized',
+        message: 'Valid API key required',
+        hint: 'Provide API key in Authorization header (Bearer <key> or ApiKey <key>) or as ?api_key=<key> query parameter'
+      });
+      return reply;
+    }
+  };
 
   /**
    * Register all MCP tools
@@ -110,6 +174,8 @@ export class FeiShuMcpServer {
       logger.info(
         `Message endpoint available at http://localhost:${port}/messages`,
       );
+      logger.info(`API Key: ${this.apiKey}`);
+      logger.info('🔒 Authentication enabled - API key required for access');
     } catch (err) {
       logger.error('Error starting server:', err);
       process.exit(1);
@@ -122,19 +188,20 @@ export class FeiShuMcpServer {
    * @param app - Fastify instance
    */
   private async configureFastifyServer(app: FastifyInstance): Promise<void> {
-    // Health check endpoint
+    // Health check endpoint (public)
     app.get('/health', async (request: FastifyRequest, reply: FastifyReply) => {
       return {
         status: 'healthy',
         timestamp: new Date().toISOString(),
         version: this.version,
         feishuAppId: this.config.feishuAppId ? this.config.feishuAppId.substring(0, 8) + '****' : 'not set',
-        feishuAppSecret: this.config.feishuAppSecret ? 'configured' : 'not configured'
+        feishuAppSecret: this.config.feishuAppSecret ? 'configured' : 'not configured',
+        authentication: 'enabled'
       };
     });
 
-    // Debug endpoint to test Feishu connection
-    app.get('/debug', async (request: FastifyRequest, reply: FastifyReply) => {
+    // Debug endpoint (requires auth)
+    app.get('/debug', { preHandler: this.requireAuth }, async (request: FastifyRequest, reply: FastifyReply) => {
       try {
         // Test Feishu API connection
         const testResult = await this.testFeishuConnection();
@@ -157,10 +224,39 @@ export class FeiShuMcpServer {
       }
     });
 
-    // SSE endpoint
+    // Public info endpoint (shows API key requirement)
+    app.get('/', async (request: FastifyRequest, reply: FastifyReply) => {
+      return {
+        name: 'FeiShu MCP Server',
+        version: this.version,
+        status: 'protected',
+        authentication: 'API key required',
+        endpoints: {
+          sse: '/sse?api_key=<your_key>',
+          messages: '/messages',
+          health: '/health',
+          debug: '/debug (requires auth)'
+        },
+        usage: {
+          sse: 'GET /sse?api_key=<your_key>',
+          messages: 'POST /messages with Authorization: Bearer <your_key> or Authorization: ApiKey <your_key>',
+          health: 'GET /health (no auth required)'
+        }
+      };
+    });
+
+    // SSE endpoint (requires auth via query parameter)
     app.get('/sse', async (request: FastifyRequest, reply: FastifyReply) => {
       try {
-        logger.info('New SSE connection established');
+        if (!this.authenticate(request)) {
+          reply.code(401).send({ 
+            error: 'Unauthorized',
+            message: 'API key required. Use ?api_key=<your_key> query parameter'
+          });
+          return;
+        }
+
+        logger.info('New SSE connection established (authenticated)');
         this.sseTransport = new FastifySSETransport('/messages', reply);
         await this.server.connect(this.sseTransport);
         await this.sseTransport.initializeSSE();
@@ -175,9 +271,10 @@ export class FeiShuMcpServer {
       }
     });
 
-    // Message handling endpoint
+    // Message handling endpoint (requires auth via header)
     app.post(
       '/messages',
+      { preHandler: this.requireAuth },
       async (request: FastifyRequest, reply: FastifyReply) => {
         try {
           if (!this.sseTransport) {
