@@ -100,7 +100,7 @@ export class FeiShuMcpServer {
     await this.configureFastifyServer(app);
 
     try {
-      await app.listen({ port });
+      await app.listen({ port, host: '0.0.0.0' });
       logger.info(`HTTP server listening on port ${port}`);
       logger.info(`SSE endpoint available at http://localhost:${port}/sse`);
       logger.info(
