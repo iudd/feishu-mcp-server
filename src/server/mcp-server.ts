@@ -29,6 +29,8 @@ export class FeiShuMcpServer {
   private sseTransport: FastifySSETransport | null = null;
   /** Server version */
   private readonly version = '0.0.1';
+  /** Server configuration */
+  private config: ServerConfig;
 
   /**
    * Create a new FeiShu MCP server
@@ -36,6 +38,8 @@ export class FeiShuMcpServer {
    * @param config - Server configuration
    */
   constructor(config: ServerConfig) {
+    this.config = config;
+    
     // Initialize FeiShu services
     const apiConfig: ApiClientConfig = {
       appId: config.feishuAppId,
@@ -118,6 +122,41 @@ export class FeiShuMcpServer {
    * @param app - Fastify instance
    */
   private async configureFastifyServer(app: FastifyInstance): Promise<void> {
+    // Health check endpoint
+    app.get('/health', async (request: FastifyRequest, reply: FastifyReply) => {
+      return {
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        version: this.version,
+        feishuAppId: this.config.feishuAppId ? this.config.feishuAppId.substring(0, 8) + '****' : 'not set',
+        feishuAppSecret: this.config.feishuAppSecret ? 'configured' : 'not configured'
+      };
+    });
+
+    // Debug endpoint to test Feishu connection
+    app.get('/debug', async (request: FastifyRequest, reply: FastifyReply) => {
+      try {
+        // Test Feishu API connection
+        const testResult = await this.testFeishuConnection();
+        return {
+          status: 'debug',
+          timestamp: new Date().toISOString(),
+          config: {
+            feishuAppId: this.config.feishuAppId ? this.config.feishuAppId.substring(0, 8) + '****' : 'not set',
+            feishuAppSecret: this.config.feishuAppSecret ? 'configured' : 'not configured',
+            apiEndpoint: API_ENDPOINT
+          },
+          feishuTest: testResult
+        };
+      } catch (err) {
+        logger.error('Debug endpoint error:', err);
+        reply.code(500).send({ 
+          error: 'Debug failed', 
+          message: err instanceof Error ? err.message : 'Unknown error'
+        });
+      }
+    });
+
     // SSE endpoint
     app.get('/sse', async (request: FastifyRequest, reply: FastifyReply) => {
       try {
@@ -152,5 +191,71 @@ export class FeiShuMcpServer {
         }
       },
     );
+  }
+
+  /**
+   * Test Feishu API connection
+   */
+  private async testFeishuConnection(): Promise<any> {
+    try {
+      // Try to get bot info as a basic connection test
+      const response = await fetch(`${API_ENDPOINT}/open-apis/bot/v3/info`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${await this.getAccessToken()}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        return { success: true, data };
+      } else {
+        const errorData = await response.text();
+        return { 
+          success: false, 
+          status: response.status,
+          statusText: response.statusText,
+          error: errorData
+        };
+      }
+    } catch (err) {
+      return { 
+        success: false, 
+        error: err instanceof Error ? err.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Get Feishu access token
+   */
+  private async getAccessToken(): Promise<string> {
+    try {
+      const response = await fetch(`${API_ENDPOINT}/open-apis/auth/v3/tenant_access_token/internal`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          app_id: this.config.feishuAppId,
+          app_secret: this.config.feishuAppSecret
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Token request failed: ${response.status} ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      if (data.code !== 0) {
+        throw new Error(`Token error: ${data.msg}`);
+      }
+
+      return data.tenant_access_token;
+    } catch (err) {
+      logger.error('Failed to get access token:', err);
+      throw err;
+    }
   }
 }
